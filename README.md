@@ -26,7 +26,7 @@ To use, you must build a container image of logspout which contains the firehose
 
 The easiest way to do this reliably is to fork the official logspout repo and add this this repo to the `modules.go` file.
 
-Then `docker build . -t <your-image-tag>` in your forked logspout repo.
+Then `docker build -t kariusdx/logspout-kinesis:1.0 .`
 
 I find this approach to work best as it ensures you use a known version of logspout as the base.
 
