@@ -7,12 +7,14 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/firehose"
+	docker "github.com/fsouza/go-dockerclient"
 	"github.com/gliderlabs/logspout/router"
 )
 
@@ -36,15 +38,23 @@ type Adapter struct {
 	debugLog             bool
 }
 
-type Record struct {
-	Timestamp     time.Time              `json:"@timestamp"`
-	ContainerId   string                 `json:"container_id"`
-	ContainerName string                 `json:"container_name"`
-	Message       string                 `json:"message"`
-	Hostname      string                 `json:"hostname"`
-	Source        string                 `json:"source"` // stdout, stderr
-	Args          map[string]interface{} `json:"args,omitempty"`
+type Container struct {
+	Name      string `json:"name"`
+	Fullpod   string `json:"full-pod,omitempty"`
+	Podprefix string `json:"pod,omitempty"`
+	Namespace string `json:"ns,omitempty"`
 }
+
+type Record map[string]interface{}
+
+// type Record struct {
+// 	Timestamp time.Time              `json:"@timestamp"`
+// 	Container *Container             `json:"container,omitempty"`
+// 	Message   string                 `json:"message,omitempty"`
+// 	Hostname  string                 `json:"hostname"`
+// 	Source    string                 `json:"source"` // stdout, stderr
+// 	Args      map[string]interface{} `json:"args,omitempty"`
+// }
 
 func init() {
 	router.AdapterFactories.Register(NewRawAdapter, "firehose")
@@ -115,26 +125,40 @@ func (adapter *Adapter) Stream(logstream chan *router.Message) {
 
 	for message := range logstream {
 
-		var jsonMsg map[string]interface{}
-		err := json.Unmarshal([]byte(message.Data), &jsonMsg)
-		// error is ignored because we don't care if we could not unmarshal
-		// we will just not have additional args
+		var data Record
+		err := json.Unmarshal([]byte(message.Data), &data)
 		if err != nil {
+			// not json
+			data = make(map[string]interface{})
+			data["message"] = message.Data
 		}
 
-		info := &Record{
-			Timestamp:     message.Time,
-			ContainerId:   message.Container.ID,
-			Message:       message.Data,
-			ContainerName: message.Container.Name,
-			Hostname:      message.Container.Config.Hostname,
-			Source:        message.Source,
-			Args:          jsonMsg,
+		//
+		container := extractKubernetesInfo(message.Container)
+
+		data["host"] = message.Container.Config.Hostname
+		data["container"] = container
+		data["source"] = message.Source
+
+		if _, exist := data["@timestamp"]; !exist {
+			data["@timestamp"] = message.Time
+		}
+		if _, exist := data["@version"]; !exist {
+			data["@version"] = 1
 		}
 
-		//adapter.logD("Stream: sending log record to deliver: %v", message.Data)
+		// rewrite format V0 into format V1
+		if fields, exist := data["@fields"]; exist {
+			if fieldMap, err := fields.(map[string]interface{}); err {
+				for k, v := range fieldMap {
+					data[strings.TrimLeft(k, "@")] = v
+				}
+				delete(data, "@fields")
+			}
+			// convert other fields?
+		}
 
-		adapter.deliver <- info
+		adapter.deliver <- &data
 	}
 }
 
@@ -258,5 +282,26 @@ type stop struct {
 func (adapter *Adapter) logD(format string, args ...interface{}) {
 	if adapter.debugLog {
 		log.Printf("firehose: "+format, args...)
+	}
+}
+
+func extractKubernetesInfo(container *docker.Container) *Container {
+	if val, exist := container.Config.Labels["io.kubernetes.container.name"]; exist {
+		fullPod := container.Config.Labels["io.kubernetes.pod.name"]
+		pod := strings.Split(container.Config.Labels["io.kubernetes.pod.name"], "-")
+		podPrefix := fullPod
+		if len(pod) > 0 {
+			podPrefix = pod[0]
+		}
+		return &Container{
+			Name:      val,
+			Fullpod:   container.Config.Labels["io.kubernetes.pod.name"],
+			Podprefix: podPrefix,
+			Namespace: container.Config.Labels["io.kubernetes.pod.namespace"],
+		}
+	} else {
+		return &Container{
+			Name: container.Name,
+		}
 	}
 }
