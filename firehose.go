@@ -198,8 +198,6 @@ func (adapter *Adapter) batchPutToFirehose() {
 		case record := <-adapter.deliver:
 			{
 
-				adapter.logD("batch: %v \n", record)
-
 				// buffer, and optionally flush
 				bytes, err := json.Marshal(record)
 				if err != nil {
