@@ -14,7 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/firehose"
-	docker "github.com/fsouza/go-dockerclient"
+	"github.com/fsouza/go-dockerclient"
 	"github.com/gliderlabs/logspout/router"
 )
 
@@ -31,18 +31,21 @@ type Adapter struct {
 	route                *router.Route
 	svc                  *firehose.Firehose
 	deliveryStreamName   *string
-	deliver              chan *Record
+	deliver              chan Record
 	bufferSize           int
 	flushTimeout         time.Duration
 	firehoseRequestLimit int
 	debugLog             bool
+	printContent         bool
+	debugContainers      map[string]bool
 }
 
-type Container struct {
+type ContainerInfo struct {
 	Name      string `json:"name"`
 	Fullpod   string `json:"full-pod,omitempty"`
 	Podprefix string `json:"pod,omitempty"`
 	Namespace string `json:"ns,omitempty"`
+	ID        string `json:"id,omitempty"`
 }
 
 type Record map[string]interface{}
@@ -102,6 +105,22 @@ func NewRawAdapter(route *router.Route) (router.LogAdapter, error) {
 		debug = true
 	}
 
+	print := false
+	if os.Getenv("LOG_CONTENT") != "" {
+		log.Println("firehose: activating print mode")
+		print = true
+	}
+
+	debugContainers := make(map[string]bool)
+	if os.Getenv("DEBUG_CONTAINERS") != "" {
+		log.Println("firehose: activating debug containers list")
+		for _, id := range strings.Split(os.Getenv("DEBUG_CONTAINERS"), ",") {
+			container := normalID(strings.TrimSpace(id))
+			log.Println("debugging container: ", container)
+			debugContainers[container] = true
+		}
+	}
+
 	svc := firehose.New(sess)
 
 	streamName := aws.String(deliveryStreamName)
@@ -109,11 +128,13 @@ func NewRawAdapter(route *router.Route) (router.LogAdapter, error) {
 		route:                route,
 		svc:                  svc,
 		deliveryStreamName:   streamName,
-		deliver:              make(chan *Record),
+		deliver:              make(chan Record),
 		bufferSize:           bufferSize,
 		flushTimeout:         flushTimeout,
 		firehoseRequestLimit: firehoseRequestLimit,
 		debugLog:             debug,
+		printContent:         print,
+		debugContainers:      debugContainers,
 	}
 
 	go adapter.batchPutToFirehose()
@@ -136,17 +157,6 @@ func (adapter *Adapter) Stream(logstream chan *router.Message) {
 		//
 		container := extractKubernetesInfo(message.Container)
 
-		data["host"] = message.Container.Config.Hostname
-		data["container"] = container
-		data["source"] = message.Source
-
-		if _, exist := data["@timestamp"]; !exist {
-			data["@timestamp"] = message.Time
-		}
-		if _, exist := data["@version"]; !exist {
-			data["@version"] = 1
-		}
-
 		// rewrite format V0 into format V1
 		if fields, exist := data["@fields"]; exist {
 			if fieldMap, err := fields.(map[string]interface{}); err {
@@ -158,7 +168,22 @@ func (adapter *Adapter) Stream(logstream chan *router.Message) {
 			// convert other fields?
 		}
 
-		adapter.deliver <- &data
+		data["host"] = message.Container.Config.Hostname
+		data["container"] = container
+		data["source"] = message.Source
+
+		if _, exist := data["@timestamp"]; !exist {
+			data["@timestamp"] = message.Time
+		}
+		if _, exist := data["@version"]; !exist {
+			data["@version"] = 1
+		}
+
+		if adapter.printContent && adapter.debugContainers[container.ID] {
+			adapter.logD("stream: %s enqueing: %v \n", container.ID, data)
+		}
+
+		adapter.deliver <- data
 	}
 }
 
@@ -172,18 +197,19 @@ func (adapter *Adapter) batchPutToFirehose() {
 		select {
 		case record := <-adapter.deliver:
 			{
-				//adapter.logD("batchPutToFirehose: got a record: %v \n", record)
+
+				adapter.logD("batch: %v \n", record)
 
 				// buffer, and optionally flush
 				bytes, err := json.Marshal(record)
 				if err != nil {
-					log.Println("batchPutToFirehose: json marshalling error - ", err)
+					log.Println("batch: json marshalling error - ", err)
 				}
 				frecord := &firehose.Record{
 					Data: append(bytes, "\n"...),
 				}
 
-				adapter.logD("batchPutToFirehose: bufferSize: %d, len: %d < %d \n", bufferSize, len(buffer), cap(buffer))
+				adapter.logD("batch: bufferSize: %d, len: %d < %d \n", bufferSize, len(buffer), cap(buffer))
 
 				if len(buffer) == cap(buffer) || bufferSize+len(frecord.Data) >= adapter.firehoseRequestLimit {
 					timeout.Reset(adapter.flushTimeout)
@@ -192,13 +218,21 @@ func (adapter *Adapter) batchPutToFirehose() {
 					bufferSize = 0
 				}
 
+				if adapter.printContent {
+					if v, ok := record["container"].(*ContainerInfo); ok {
+						if adapter.debugContainers[v.ID] {
+							adapter.logD("batch: %s batching record: %v", v.ID, string(frecord.Data))
+						}
+					}
+				}
+
 				bufferSize = bufferSize + len(frecord.Data)
 				buffer = append(buffer, frecord)
 			}
 		case <-timeout.C:
 			{
 				// flush
-				adapter.logD("batchPutToFirehose: timeout: %d, len: %d < %d \n", bufferSize, len(buffer), cap(buffer))
+				adapter.logD("batch: timeout: %d, len: %d < %d \n", bufferSize, len(buffer), cap(buffer))
 				if len(buffer) > 0 {
 					go adapter.flushBuffer(buffer)
 					buffer = adapter.newBuffer()
@@ -285,7 +319,7 @@ func (adapter *Adapter) logD(format string, args ...interface{}) {
 	}
 }
 
-func extractKubernetesInfo(container *docker.Container) *Container {
+func extractKubernetesInfo(container *docker.Container) *ContainerInfo {
 	if val, exist := container.Config.Labels["io.kubernetes.container.name"]; exist {
 		fullPod := container.Config.Labels["io.kubernetes.pod.name"]
 		pod := strings.Split(container.Config.Labels["io.kubernetes.pod.name"], "-")
@@ -293,15 +327,24 @@ func extractKubernetesInfo(container *docker.Container) *Container {
 		if len(pod) > 0 {
 			podPrefix = pod[0]
 		}
-		return &Container{
+		return &ContainerInfo{
 			Name:      val,
 			Fullpod:   container.Config.Labels["io.kubernetes.pod.name"],
 			Podprefix: podPrefix,
 			Namespace: container.Config.Labels["io.kubernetes.pod.namespace"],
+			ID:        normalID(container.ID),
 		}
 	} else {
-		return &Container{
+		return &ContainerInfo{
 			Name: container.Name,
+			ID:   normalID(container.ID),
 		}
 	}
+}
+
+func normalID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
