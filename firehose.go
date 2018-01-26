@@ -356,7 +356,9 @@ func extractKubernetesInfo(container *docker.Container) *ContainerInfo {
 		fullPod := container.Config.Labels["io.kubernetes.pod.name"]
 		pod := strings.Split(container.Config.Labels["io.kubernetes.pod.name"], "-")
 		podPrefix := fullPod
-		if len(pod) > 0 {
+		if len(pod) > 2 {
+			podPrefix = strings.Join(pod[:len(pod)-2], "-")
+		} else if len(pod) > 0 {
 			podPrefix = pod[0]
 		}
 		return &ContainerInfo{
