@@ -142,6 +142,25 @@ func NewRawAdapter(route *router.Route) (router.LogAdapter, error) {
 	return adapter, nil
 }
 
+var levelToValue = map[string]int{
+	"TRACE":    000,
+	"trace":    000,
+	"DEBUG":    100,
+	"debug":    100,
+	"INFO":     200,
+	"info":     200,
+	"NOTICE":   250,
+	"notice":   250,
+	"WARN":     300,
+	"warn":     300,
+	"ERROR":    400,
+	"error":    400,
+	"FATAL":    500,
+	"fatal":    500,
+	"CRITICAL": 500,
+	"critical": 500,
+}
+
 func (adapter *Adapter) Stream(logstream chan *router.Message) {
 
 	for message := range logstream {
@@ -166,6 +185,21 @@ func (adapter *Adapter) Stream(logstream chan *router.Message) {
 				delete(data, "@fields")
 			}
 			// convert other fields?
+		}
+
+		// make sure level is a number
+		// and populate log_level as string
+		if v, exist := data["level"]; exist {
+			if nb, ok := v.(string); ok {
+				if _, err := strconv.Atoi(nb); err != nil {
+					data["log_level"] = nb
+					if level, exist := levelToValue[nb]; exist {
+						data["level"] = level
+					} else {
+						delete(data, "level")
+					}
+				}
+			}
 		}
 
 		data["host"] = message.Container.Config.Hostname
