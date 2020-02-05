@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -14,7 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/firehose"
-	"github.com/fsouza/go-dockerclient"
+	docker "github.com/fsouza/go-dockerclient"
 	"github.com/gliderlabs/logspout/router"
 )
 
@@ -356,8 +357,17 @@ func extractKubernetesInfo(container *docker.Container) *ContainerInfo {
 		fullPod := container.Config.Labels["io.kubernetes.pod.name"]
 		pod := strings.Split(container.Config.Labels["io.kubernetes.pod.name"], "-")
 		podPrefix := fullPod
+		// blahblah-rs_id-pod_id
 		if len(pod) > 2 {
-			podPrefix = strings.Join(pod[:len(pod)-2], "-")
+			// by default remove the 2 last components (rs_id and pod_id)
+			joinSegments := 2
+			lastPart := pod[len(pod)-1]
+			if len(lastPart) < 5 && isInt(lastPart) {
+				// we have a statefulset, so we only remove the last component
+				// which is the statefulset index
+				joinSegments = 1
+			}
+			podPrefix = strings.Join(pod[:len(pod)-joinSegments], "-")
 		} else if len(pod) > 0 {
 			podPrefix = pod[0]
 		}
@@ -381,4 +391,25 @@ func normalID(id string) string {
 		return id[:12]
 	}
 	return id
+}
+
+var allDigits = regexp.MustCompile(`^[0-9]+$`)
+
+func isInt(v string) bool {
+	switch v {
+	case "0":
+		return true
+	case "1":
+		return true
+	case "2":
+		return true
+	case "3":
+		return true
+	case "4":
+		return true
+	case "5":
+		return true
+	default:
+		return allDigits.MatchString(v)
+	}
 }
