@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"regexp"
@@ -162,63 +163,70 @@ var levelToValue = map[string]int{
 	"critical": 500,
 }
 
+// Stream decode message and send it to the firehose queue
 func (adapter *Adapter) Stream(logstream chan *router.Message) {
 
 	for message := range logstream {
 
-		var data Record
-		err := json.Unmarshal([]byte(message.Data), &data)
-		if err != nil {
-			// not json
-			data = make(map[string]interface{})
-			data["message"] = message.Data
-		}
-
-		//
 		container := extractKubernetesInfo(message.Container)
+		dec := json.NewDecoder(strings.NewReader(message.Data))
+		for {
+			var data Record
 
-		// rewrite format V0 into format V1
-		if fields, exist := data["@fields"]; exist {
-			if fieldMap, err := fields.(map[string]interface{}); err {
-				for k, v := range fieldMap {
-					data[strings.TrimLeft(k, "@")] = v
-				}
-				delete(data, "@fields")
+			err := dec.Decode(&data)
+			if err == io.EOF {
+				// all done with this message, check next one
+				continue
 			}
-			// convert other fields?
-		}
+			if err != nil {
+				// not json
+				data = make(map[string]interface{})
+				data["message"] = message.Data
+			}
 
-		// make sure level is a number
-		// and populate log_level as string
-		if v, exist := data["level"]; exist {
-			if nb, ok := v.(string); ok {
-				if _, err := strconv.Atoi(nb); err != nil {
-					data["log_level"] = nb
-					if level, exist := levelToValue[nb]; exist {
-						data["level"] = level
-					} else {
-						delete(data, "level")
+			// rewrite format V0 into format V1
+			if fields, exist := data["@fields"]; exist {
+				if fieldMap, err := fields.(map[string]interface{}); err {
+					for k, v := range fieldMap {
+						data[strings.TrimLeft(k, "@")] = v
+					}
+					delete(data, "@fields")
+				}
+				// convert other fields?
+			}
+
+			// make sure level is a number
+			// and populate log_level as string
+			if v, exist := data["level"]; exist {
+				if nb, ok := v.(string); ok {
+					if _, err := strconv.Atoi(nb); err != nil {
+						data["log_level"] = nb
+						if level, exist := levelToValue[nb]; exist {
+							data["level"] = level
+						} else {
+							delete(data, "level")
+						}
 					}
 				}
 			}
-		}
 
-		data["host"] = message.Container.Config.Hostname
-		data["container"] = container
-		data["source"] = message.Source
+			data["host"] = message.Container.Config.Hostname
+			data["container"] = container
+			data["source"] = message.Source
 
-		if _, exist := data["@timestamp"]; !exist {
-			data["@timestamp"] = message.Time
-		}
-		if _, exist := data["@version"]; !exist {
-			data["@version"] = 1
-		}
+			if _, exist := data["@timestamp"]; !exist {
+				data["@timestamp"] = message.Time
+			}
+			if _, exist := data["@version"]; !exist {
+				data["@version"] = 1
+			}
 
-		if adapter.printContent && adapter.debugContainers[container.ID] {
-			adapter.logD("stream: %s enqueing: %v \n", container.ID, data)
-		}
+			if adapter.printContent && adapter.debugContainers[container.ID] {
+				adapter.logD("stream: %s enqueing: %v \n", container.ID, data)
+			}
 
-		adapter.deliver <- data
+			adapter.deliver <- data
+		}
 	}
 }
 
